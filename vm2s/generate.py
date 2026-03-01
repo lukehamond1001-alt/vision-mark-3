@@ -1,10 +1,9 @@
 """
 Text generation from a trained VM2 Simple checkpoint.
 
-Handles dynamically-sized models — grows to match prompt length if needed.
-
 Usage:
     python -m vm2s.generate --checkpoint checkpoints/best.pt --prompt "the "
+    python -m vm2s.generate --checkpoint checkpoints/best.pt --interactive
 """
 
 import argparse
@@ -12,7 +11,6 @@ import torch
 import torch.nn.functional as F
 
 from vm2s.model import VM2Model, text_to_values, values_to_text, CHAR_MAP
-from vm2s.config import VM2Config
 
 
 def get_device():
@@ -32,19 +30,21 @@ def generate(
     top_k: int = 0,
     device: torch.device = torch.device("cpu"),
 ) -> str:
-    """Generate text autoregressively. Model grows if input exceeds capacity."""
+    """Generate text autoregressively."""
     model.eval()
+    seq_len = model.config.seq_len
 
+    # Clean prompt: lowercase, keep only known chars
     prompt = prompt.lower()
     values = text_to_values(prompt)
 
     for _ in range(max_tokens):
-        input_len = len(values)
+        # Take last seq_len values, pad with space if needed
+        window = values[-seq_len:]
+        while len(window) < seq_len:
+            window = [CHAR_MAP[" "]] + window  # pad with space
 
-        # Grow model if input exceeds current capacity
-        model.ensure_capacity(input_len)
-
-        x = torch.tensor([values], dtype=torch.long, device=device)
+        x = torch.tensor([window], dtype=torch.long, device=device)
         logits = model(x)
         logits = logits[0]
 
@@ -57,7 +57,7 @@ def generate(
 
         probs = F.softmax(logits, dim=-1)
         next_idx = torch.multinomial(probs, 1).item()
-        next_val = next_idx + 1
+        next_val = next_idx + 1  # back to 1-indexed
 
         values.append(next_val)
 
@@ -80,14 +80,8 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = ckpt["config"]
     model = VM2Model(config).to(device)
-    # Grow model to match checkpoint's sequence length before loading
-    ckpt_seq_len = ckpt.get("seq_len", config.start_len)
-    model.ensure_capacity(ckpt_seq_len)
-
     model.load_state_dict(ckpt["model"])
-    print(f"Loaded: step {ckpt.get('step', '?')}, "
-          f"seq_len={ckpt.get('seq_len', '?')}, "
-          f"params={model.count_parameters():,}")
+    print(f"Loaded checkpoint: step {ckpt.get('step', '?')}, params: {model.count_parameters():,}")
 
     if args.interactive:
         print("\nInteractive mode. Type a prompt, press Enter. Ctrl+C to quit.\n")
