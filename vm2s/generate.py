@@ -80,6 +80,10 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = ckpt["config"]
     model = VM2Model(config).to(device)
+    # Grow model to match checkpoint's sequence length before loading
+    ckpt_seq_len = ckpt.get("seq_len", config.start_len)
+    model.ensure_capacity(ckpt_seq_len)
+
     model.load_state_dict(ckpt["model"])
     print(f"Loaded: step {ckpt.get('step', '?')}, "
           f"seq_len={ckpt.get('seq_len', '?')}, "
