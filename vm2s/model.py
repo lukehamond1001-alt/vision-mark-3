@@ -1,24 +1,22 @@
 """
-VM2 Simple Model: 2-layer dendritic character-level predictor.
+VM2 Simple Model — Dynamic Growing Architecture.
 
 Layer 1 (BinaryDendriteLayer):
   - No learnable parameters. Deterministic.
-  - 1 neuron with seq_len * vocab_size dendrites.
+  - Accepts variable-length input.
   - Each dendrite = one (position, character) key.
-  - Output: binary vector — 1 if the character at that position matches, 0 otherwise.
-  - Exactly seq_len dendrites fire per input (one per position).
+  - Output: binary vector — 1 if character matches at that position.
 
 Layer 2 (ScoringLayer):
   - vocab_size neurons (one per possible next character).
-  - Each neuron has one weight per Layer 1 dendrite (per key).
-  - Weights are bounded positive: max_weight * sigmoid(raw_param).
-  - Output = geometric mean of the weights at active (fired) dendrites.
-  - These outputs serve as logits for next-character prediction.
+  - Weights organized as (vocab_size_out, current_positions, vocab_size_in).
+  - GROWS dynamically: when a longer input arrives, new random weights
+    are added for the new positions before training on it.
+  - Geometric mean of active weights → logit.
 """
 
 import torch
 import torch.nn as nn
-from typing import Tuple
 
 from vm2s.config import VM2Config
 
@@ -46,139 +44,161 @@ def values_to_text(values: list) -> str:
 class BinaryDendriteLayer(nn.Module):
     """Layer 1: deterministic binary dendrites. No learnable parameters.
 
-    Each dendrite is a (position, character) key.
-    Dendrite index = position * vocab_size + (char_value - 1).
-
-    Input:  (batch, seq_len) integer char values
-    Output: (batch, seq_len * vocab_size) binary tensor
+    Accepts VARIABLE length input. Output size = input_len * vocab_size.
     """
 
-    def __init__(self, config: VM2Config):
+    def __init__(self, vocab_size: int):
         super().__init__()
-        self.seq_len = config.seq_len
-        self.vocab_size = config.vocab_size
-        self.num_dendrites = config.seq_len * config.vocab_size
+        self.vocab_size = vocab_size
 
     def forward(self, char_values: torch.Tensor) -> torch.Tensor:
         """
         Args:
             char_values: (batch, seq_len) — integer values 1..vocab_size, 0 = masked/hidden
+                         seq_len can be ANY length
 
         Returns:
-            binary: (batch, num_dendrites) — fires only for revealed positions
+            binary: (batch, seq_len * vocab_size) — fires only for revealed positions
         """
         batch = char_values.shape[0]
 
-        # Create mask: 1 for revealed positions (value > 0), 0 for hidden
-        revealed = (char_values > 0).float()  # (batch, seq_len)
+        # Mask: 1 for revealed positions (value > 0), 0 for hidden
+        revealed = (char_values > 0).float()
 
-        # One-hot encode each position: (batch, seq_len, vocab_size)
-        # char_values are 1-indexed, shift to 0-indexed for one_hot
-        # Clamp so masked positions (0) map to index 0 — we'll zero them out after
+        # One-hot: (batch, seq_len, vocab_size)
         zero_indexed = (char_values - 1).clamp(min=0)
         one_hot = torch.nn.functional.one_hot(zero_indexed, self.vocab_size).float()
 
-        # Zero out masked positions: multiply by revealed mask
-        # revealed: (batch, seq_len) → (batch, seq_len, 1)
+        # Zero out masked positions
         one_hot = one_hot * revealed.unsqueeze(-1)
 
-        # Flatten to (batch, seq_len * vocab_size)
+        # Flatten: (batch, seq_len * vocab_size)
         binary = one_hot.reshape(batch, -1)
 
         return binary
 
 
 class ScoringLayer(nn.Module):
-    """Layer 2: learned scoring via multiplicative weights.
+    """Layer 2: learned scoring with GROWABLE weights.
 
-    Each of vocab_size neurons has one weight per Layer 1 dendrite.
-    The weight is the learned value for that (position, character) key.
-    Weights are bounded positive: max_weight * sigmoid(raw_param).
-
-    For each input:
-      - Identify which dendrites fired (binary = 1)
-      - Gather the corresponding weights
-      - Compute geometric mean of those weights → output logit
-
-    Output: (batch, vocab_size) logits
+    Weights stored as (vocab_size_out, current_positions, vocab_size_in).
+    Can grow to accommodate longer inputs by adding new random weights.
     """
 
-    def __init__(self, config: VM2Config):
+    def __init__(self, config: VM2Config, initial_positions: int = 2):
         super().__init__()
         self.vocab_size = config.vocab_size
-        self.num_dendrites = config.seq_len * config.vocab_size
         self.max_weight = float(config.max_weight)
+        self.current_positions = initial_positions
 
-        # Raw weight parameters: (vocab_size, num_dendrites)
-        # Each row = one output neuron's weights over all (pos, char) keys
+        # Weights: (vocab_size_out, positions, vocab_size_in)
+        # Each output neuron has weights for each (position, character) key
         self.raw_weights = nn.Parameter(
-            torch.zeros(self.vocab_size, self.num_dendrites)
+            torch.zeros(self.vocab_size, initial_positions, self.vocab_size)
         )
         nn.init.uniform_(self.raw_weights, -1.0, 1.0)
 
+    def grow(self, new_positions: int):
+        """Grow the weight matrix to handle inputs up to new_positions long.
+
+        New weights are randomly initialized. Existing weights are preserved.
+        """
+        if new_positions <= self.current_positions:
+            return
+
+        added = new_positions - self.current_positions
+        device = self.raw_weights.device
+        dtype = self.raw_weights.dtype
+
+        # Create new random weights for the new positions
+        new_weights = torch.zeros(
+            self.vocab_size, added, self.vocab_size,
+            device=device, dtype=dtype,
+        )
+        nn.init.uniform_(new_weights, -1.0, 1.0)
+
+        # Concatenate with existing weights
+        combined = torch.cat([self.raw_weights.data, new_weights], dim=1)
+
+        # Replace parameter
+        self.raw_weights = nn.Parameter(combined)
+        self.current_positions = new_positions
+
     def _get_weights(self) -> torch.Tensor:
-        """Compute bounded positive weights from raw parameters."""
-        return self.max_weight * torch.sigmoid(self.raw_weights)
+        """Compute bounded positive weights: (vocab_size_out, positions * vocab_size_in)."""
+        w = self.max_weight * torch.sigmoid(self.raw_weights)
+        # Flatten positions and vocab_in dims
+        return w.reshape(self.vocab_size, -1)
 
     def forward(self, binary: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            binary: (batch, num_dendrites) — binary activation from Layer 1
+            binary: (batch, num_dendrites) — binary from Layer 1
+                    num_dendrites = input_len * vocab_size
 
         Returns:
             logits: (batch, vocab_size)
         """
-        weights = self._get_weights()  # (vocab_size, num_dendrites)
+        weights = self._get_weights()  # (vocab_size_out, total_dendrites)
 
-        # Number of active dendrites per sample (should be seq_len)
-        # binary shape: (batch, num_dendrites)
-        # weights shape: (vocab_size, num_dendrites)
+        # binary might be shorter than weights if input < current_positions
+        # Pad binary to match weight size
+        num_dendrites = binary.shape[1]
+        total_weights = weights.shape[1]
 
-        # Expand for broadcasting:
-        # binary: (batch, 1, num_dendrites)
-        # weights: (1, vocab_size, num_dendrites)
-        b = binary.unsqueeze(1)       # (batch, 1, num_dendrites)
-        w = weights.unsqueeze(0)      # (1, vocab_size, num_dendrites)
+        if num_dendrites < total_weights:
+            pad = torch.zeros(
+                binary.shape[0], total_weights - num_dendrites,
+                device=binary.device, dtype=binary.dtype,
+            )
+            binary = torch.cat([binary, pad], dim=1)
 
-        # Mask: only active dendrites contribute
-        # For inactive dendrites, substitute 1.0 so log(1)=0 (neutral in product)
+        # Expand for broadcasting
+        b = binary.unsqueeze(1)       # (batch, 1, total_dendrites)
+        w = weights.unsqueeze(0)      # (1, vocab_size, total_dendrites)
+
+        # Geometric mean of active weights
         safe_weights = torch.where(
             b.bool(),
             w.clamp(min=1e-8),
             torch.ones_like(w),
         )
 
-        # Geometric mean via log-space:
-        # log of each active weight, sum, divide by n, exp
         log_w = torch.log(safe_weights)
         log_sum = (log_w * b).sum(dim=-1)  # (batch, vocab_size)
 
-        n_active = b.sum(dim=-1)  # (batch, 1) — should be seq_len
-        safe_n = n_active.clamp(min=1)
-
-        log_geomean = log_sum / safe_n
-        logits = torch.exp(log_geomean)  # (batch, vocab_size)
+        n_active = b.sum(dim=-1).clamp(min=1)  # (batch, 1)
+        log_geomean = log_sum / n_active
+        logits = torch.exp(log_geomean)
 
         return logits
 
 
 class VM2Model(nn.Module):
-    """Full VM2 Simple model: Layer 1 (binary) → Layer 2 (scoring).
+    """Full VM2 model with dynamic dendrite growth.
 
-    Layer 1 asks: "what character is at each position?"
-    Layer 2 asks: "given what's where, what comes next?"
+    Before feeding a longer input, call ensure_capacity(length)
+    to grow the scoring layer if needed.
     """
 
     def __init__(self, config: VM2Config):
         super().__init__()
         self.config = config
-        self.layer1 = BinaryDendriteLayer(config)
-        self.layer2 = ScoringLayer(config)
+        self.layer1 = BinaryDendriteLayer(config.vocab_size)
+        self.layer2 = ScoringLayer(config, initial_positions=config.start_len)
+
+    def ensure_capacity(self, seq_len: int):
+        """Grow the model if seq_len exceeds current capacity."""
+        if seq_len > self.layer2.current_positions:
+            old = self.layer2.current_positions
+            self.layer2.grow(seq_len)
+            return old, seq_len  # grew from old to new
+        return None
 
     def forward(self, char_values: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            char_values: (batch, seq_len) — integer char values 1..vocab_size
+            char_values: (batch, seq_len) — ANY length, integer char values
 
         Returns:
             logits: (batch, vocab_size)
@@ -189,3 +209,7 @@ class VM2Model(nn.Module):
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    @property
+    def current_positions(self):
+        return self.layer2.current_positions
