@@ -48,30 +48,47 @@ Simple integer mapping: `a=1, b=2, ..., z=26, space=27`. Text is lowercased and 
 
 ---
 
+## Architecture Update: Dynamic Dendrite Growth
+
+In Vision Mark 2, `seq_len` was fixed at 46. Vision Mark 3 removes this restriction: **the model dynamically grows its dendrites to match the input length.**
+
+- **Starts small**: Training begins at `seq_len = 2`.
+- **Grows on demand**: Every 500 steps, if a longer sequence is needed, Layer 2 dynamically adds randomly initialized weights for the new positions.
+- **Permanent capacity**: Once grown, the new dendrites are permanently available. Shorter inputs simply leave the later dendrites inactive (zeros).
+
+---
+
 ## Training Results
 
 Trained on **Simple English Wikipedia** (5M characters, letters + spaces only).
 
-### Full-context model (seq_len=46, 33,534 params)
+### Dynamic Growth Model (100K steps)
 
-| Steps | Train Loss | Val Loss |
-|---|---|---|
-| 100 | 3.44 | — |
-| 5,000 | 2.87 | 2.86 |
-| 50,000 | 2.50 | 2.50 |
-| 200,000 | 2.46 | 2.46 |
+- **Starting parameters**: 1,458 (`seq_len=2`)
+- **Final parameters**: 147,258 (`seq_len=202`)
+- **Final loss**: 2.89
 
-Random baseline: ln(27) ≈ 3.30. Model exceeds it by step ~1,200.
+| Steps | seq_len | Params | Loss |
+|---|---|---|---|
+| 0 | 2 | 1,458 | 3.29 |
+| 10,000 | 22 | 16,038 | 2.97 |
+| 22,000 | 46 | 33,534 | 2.88 |
+| 50,000 | 102 | 74,358 | 2.88 |
+| 100,000 | 202 | 147,258 | 2.89 |
 
-### Progressive reveal model (seq_len=46, 33,534 params)
+### The "Signal Dilution" Bottleneck
 
-| Steps | Train Loss | Val Loss |
-|---|---|---|
-| 500 | 3.79 | — |
-| 5,000 | 3.18 | 3.39 |
-| 50,000 | 2.80 | 2.82 |
+While the model successfully learned to handle variable-length sequences up to 202 characters, text generation quality at long contexts degrades compared to the fixed 46-char model.
 
-Higher loss because each sample averages over 1–45 chars of visible context — harder task than always seeing 46.
+**Prompt**: `"the cat "`
+**Output (202-char model)**: `"the cat ee te te a at a atat t eee tehete eate ethe te ewe e te ate ..."`
+
+**Why?**
+Because Layer 2 uses a pure geometric mean across ALL active dendrites. 
+- With a 46-char context, each character casts a $\frac{1}{46}$ vote.
+- With a 202-char context, each character casts a $\frac{1}{202}$ vote.
+
+Even if the model learns that the 3 most recent characters are critical for predicting the next one, their strong signal is completely washed out by the 199 neutral/noisy signals from the earlier context window. This proves that a purely multiplicative architecture *must* have a mechanism to dynamically weight or ignore irrelevant past context (e.g. self-attention or a hidden layer) to support long sequences.
 
 ---
 
@@ -81,30 +98,30 @@ Higher loss because each sample averages over 1–45 chars of visible context �
 # Install
 pip install -r requirements.txt
 
-# Train on Simple Wikipedia (downloads automatically)
-python -m vm2s.train --wiki --out_dir checkpoints --max_steps 50000
+# Train with dynamic growth (starts at len 2, grows up to 256)
+python -m vm2s.train --wiki --out_dir checkpoints \
+    --start_len 2 --grow_every 500 --max_len 256 --max_steps 100000
 
-# Train on any text file
-python -m vm2s.train --data path/to/text.txt --out_dir checkpoints
-
-# Generate text
-python -m vm2s.generate --checkpoint checkpoints/best.pt --prompt "the "
+# Generate text (model grows dynamically if prompt exceeds capacity)
+python -m vm2s.generate --checkpoint checkpoints/final.pt --prompt "the "
 
 # Interactive mode
-python -m vm2s.generate --checkpoint checkpoints/best.pt --interactive
+python -m vm2s.generate --checkpoint checkpoints/final.pt --interactive
 ```
 
 ### Training options
 
 ```bash
 python -m vm2s.train \
-    --wiki \
+    --data path/to/text.txt \
     --out_dir checkpoints \
-    --seq_len 46 \
+    --start_len 2 \
+    --grow_every 500 \
+    --max_len 256 \
     --batch_size 32 \
     --lr 3e-4 \
-    --max_steps 50000 \
-    --log_interval 500 \
+    --max_steps 100000 \
+    --log_interval 200 \
     --save_interval 5000
 ```
 
